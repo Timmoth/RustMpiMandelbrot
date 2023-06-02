@@ -3,14 +3,15 @@ use mpi::traits::*;
 use std::time::{Duration, SystemTime};
 use std::thread::sleep;
 use std::time;
+use std::process;
 
 fn main() {
     
     // Config
-    let height:usize = 2240;
-    let width:usize = 2240;
-    let iterations = 8000;
-    let zoomFactor: f64 = 200000000000000.0;
+    let height:usize = 8000;
+    let width:usize = 8000;
+    let iterations = 12000;
+    let zoomFactor: f64 = 20000.0;
     let scale = 1.0 / zoomFactor;
     // Center point
     let cX = -1.74995768370609350360221450607069970727110579726252077930242837820286008082972804887218672784431700831100544507655659531379747541999999995;
@@ -27,86 +28,109 @@ fn main() {
     // Begin
     println!("Start node: {}/{}, {}x{}, {}, {}", rank, size, width, height, iterations, zoomFactor);
 
-    // Size of image this node should calculate
-    let imgx = width as usize;
-    let imgy = (height / size) as usize;
+    if(rank == 0){
+        let mut linesOut: i32 = 0;
+        let mut linesIn: i32 = 0;
 
-    // Used to store pixel values
-    let mut data: Vec<u8> = vec![0u8; (imgx * imgy) as usize];
-
-    // The y component for the current pixel being calculated
-    let mut y1: f64 = (height as f64 / -2.0) * scale + cY + scale * (imgy * rank) as f64;
-
-    // Calculate each pixel
-    for y in 0..imgy{
-        let timer = SystemTime::now();
-
-        // The x component for the current pixel being calculated
-        let mut x1: f64 = (imgx as f64 / -2.0) * scale + &cX;
-
-        for x in 0..imgx {
-
-            // Mandelbrot escape time algorithm
-            let mut zX1 = x1;
-            let mut zY1 = y1;
-
-            let mut zX2 = &zX1 * &zX1;
-            let mut zY2 = &zY1 * &zY1;
-
-            let mut i = 0;
-            while i < iterations && &zX2 + &zY2 < 4.0 {
-                zX2 = &zX1 * &zX1;
-                zY2 = &zY1 * &zY1;
-                
-                zY1 = &zX1 * &zY1 + &zX1 * &zY1 + &y1;
-                zX1 = &zX2 - &zY2 + &x1;
-                i += 1;
-            }
-            
-            // Store the color value based on the escape time
-            data[y * imgx + x] = (i % 16) as u8;
-            
-            // Move across to the next pixel
-            x1 += &scale;
-        }
-
-        // Move down to the next row
-        y1 += &scale;
-
-        // Status update
-        match timer.elapsed() {
-            Ok(elapsed) => {
-                println!("Rank{} {}/{} {}ms", rank, y, imgy, elapsed.as_millis());
-            }
-            Err(e) => {
-                println!("Error: {e:?}");
-            }
-        }
-    }
-   
-
-    if world.rank() == 0 {
-        // Collect data on the root node
-        let mut t = vec![0u8; width * height];
-        root_process.gather_into_root(&data[..], &mut t[..]);
-
-        // Draw collected pixel data to the image
         let mut imageBuffer = image::ImageBuffer::new(width as u32, height as u32);
-        for y in 0..height {
-            for x in 0..width {
-                let pixel = imageBuffer.get_pixel_mut(x as u32, y as u32);
-                let shade = t[(y * imgx + x) as usize];
-                *pixel = image::Rgb([getR(shade), getG(shade), getB(shade)]);
+        let mut data: Vec<u8> = vec![0u8; width];
+
+        loop {
+            let r = world.any_process().receive_into(&mut data);
+            
+            if(r.tag() != 0){
+                linesIn+=1;
+                println!("{} Finished line: {}", r.source_rank(), r.tag());
+                let y = r.tag() as u32;
+                for x in 0..width {
+                    let pixel = imageBuffer.get_pixel_mut(x as u32, y);
+                    let shade = data[x];
+                    *pixel = image::Rgb([getR(shade), getG(shade), getB(shade)]);
+                }
+            }
+            
+            world.process_at_rank(r.source_rank()).send(&mut linesOut);
+            linesOut += 1;
+
+            if(linesIn >= (height - 1) as i32){
+                println!("Exit");
+                // Save image to file
+                let file_name = format!("fractal-{}x{}-{}-{}.png", width, height, zoomFactor, iterations);
+                imageBuffer.save(file_name).unwrap();
+                world.abort(0);
+                break;
             }
         }
-
-        // Save image to file
-        let file_name = format!("fractal-{}x{}-{}-{}.png", width, height, zoomFactor, iterations);
-        imageBuffer.save(file_name).unwrap();
         
-    } else {
-        // Send data to root node
-        root_process.gather_into(&data[..]);
+
+    }else{
+        let mut lineIndex = 0;
+        // Used to store pixel values
+
+        let mut data: Vec<u8> = vec![0u8;width];
+
+        root_process.send_with_tag(&data, lineIndex);
+        root_process.receive_into(&mut lineIndex);
+        
+        loop {
+
+            if(lineIndex >= height as i32){
+                println!("Exit node {}", rank);
+                break;
+            }
+            
+            let mut y = lineIndex;
+
+
+            // The y component for the current pixel being calculated
+            let mut y1: f64 = (height as f64 / -2.0) * scale + cY + scale * y as f64;
+            println!("{} Working on line: {}", rank, y);
+
+            // Calculate each pixel
+            let timer = SystemTime::now();
+
+                // The x component for the current pixel being calculated
+                let mut x1: f64 = (width as f64 / -2.0) * scale + &cX;
+
+                for x in 0..width {
+
+                    // Mandelbrot escape time algorithm
+                    let mut zX1 = x1;
+                    let mut zY1 = y1;
+
+                    let mut zX2 = &zX1 * &zX1;
+                    let mut zY2 = &zY1 * &zY1;
+
+                    let mut i = 0;
+                    while i < iterations && &zX2 + &zY2 < 4.0 {
+                        zX2 = &zX1 * &zX1;
+                        zY2 = &zY1 * &zY1;
+                        
+                        zY1 = &zX1 * &zY1 + &zX1 * &zY1 + &y1;
+                        zX1 = &zX2 - &zY2 + &x1;
+                        i += 1;
+                    }
+                    
+                    // Store the color value based on the escape time
+                    data[x] = (i % 16) as u8;
+                    
+                    // Move across to the next pixel
+                    x1 += &scale;
+                }
+
+                // Status update
+                match timer.elapsed() {
+                    Ok(elapsed) => {
+                        println!("Rank{} {}/{} {}ms", rank, y, height, elapsed.as_millis());
+                    }
+                    Err(e) => {
+                        println!("Error: {e:?}");
+                    }
+                }
+
+                root_process.send_with_tag(&data, y);
+                root_process.receive_into(&mut lineIndex);
+        }
     }
 }
 
